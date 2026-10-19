@@ -89,7 +89,42 @@ function refereeCall(name,args){return supabaseClient.rpc(name,args)}
 async function refreshRefereeEvents(){if(!refereeToken)throw new Error('裁判登入已失效，請重新登入。');const {data,error}=await refereeCall('ta_referee_list_events',{p_token:refereeToken});if(error)throw error;const events=(data||[]).map(r=>r.state).filter(Boolean);db.events=events;saveDb();renderEvents();const sel=$('refereeEventSelect'),saved=loadRefFilters(),old=sel.value||saved.event;sel.innerHTML=events.map(e=>`<option value="${esc(e.id)}">${esc(e.name)}</option>`).join('');if(events.some(e=>e.id===old))sel.value=old;else if(saved.event&&events.some(e=>e.id===saved.event))sel.value=saved.event;renderRefereeScores();return events}
 function renderRefereeScores(){const eid=$('refereeEventSelect')?.value;const e=findEvent(eid);if(!e){$('refereeScoreList').innerHTML='<div class="empty">目前沒有可操作的公開賽事。</div>';return}const matches=e.matches||[],saved=loadRefFilters(),oldVenue=$('refereeVenueSelect').value||saved.venue||'ALL',oldZone=$('refereeZoneSelect').value||saved.zone||'ALL';const venues=[...new Set(matches.map(m=>m.venue||'場地 1'))].sort((a,b)=>Number(a.replace(/\D/g,''))-Number(b.replace(/\D/g,'')));const zones=[...new Set(matches.map(m=>m.zone||'A'))];$('refereeVenueSelect').innerHTML='<option value="ALL">全部場地</option>'+venues.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('');$('refereeZoneSelect').innerHTML='<option value="ALL">全部分區</option>'+zones.map(z=>`<option value="${esc(z)}">${z==='FINAL'?'決賽區':esc(z+' 區')}</option>`).join('');if([...$('refereeVenueSelect').options].some(o=>o.value===oldVenue))$('refereeVenueSelect').value=oldVenue;if([...$('refereeZoneSelect').options].some(o=>o.value===oldZone))$('refereeZoneSelect').value=oldZone;const filtered=matches.filter(m=>($('refereeVenueSelect').value==='ALL'||(m.venue||'場地 1')===$('refereeVenueSelect').value)&&($('refereeZoneSelect').value==='ALL'||(m.zone||'A')===$('refereeZoneSelect').value)).sort((a,b)=>String(a.venue||'').localeCompare(String(b.venue||''),'zh-Hant',{numeric:true})||(a.venueMatchNo||a.matchNo)-(b.venueMatchNo||b.matchNo));$('refereeScoreList').innerHTML=filtered.length?filtered.map(m=>`<div class="judge-match"><strong>${esc(m.venue||'場地 1')} · ${esc(m.zone==='FINAL'?'決賽區':(m.zone||'A')+' 區')} · 第 ${esc(m.venueMatchNo||m.matchNo)} 場</strong><div class="muted small">${esc(m.roundName)} · ${esc(m.status)}</div><div class="grid"><div class="s6">${m.p1?`<button class="judge-pick ${m.winner?.id===m.p1.id?'primary':''}" style="width:100%;white-space:normal" ${m.p2?'':'disabled'} onclick="refereeChooseWinner('${e.id}','${m.id}','${m.p1.id}')">${m.winner?.id===m.p1.id?'✓ 已晉級：':'確認勝者：'}${esc(m.p1.name)}</button>`:'選手 1 待定'}</div><div class="s6">${m.p2?`<button class="judge-pick ${m.winner?.id===m.p2.id?'primary':''}" style="width:100%;white-space:normal" ${m.p1?'':'disabled'} onclick="refereeChooseWinner('${e.id}','${m.id}','${m.p2.id}')">${m.winner?.id===m.p2.id?'✓ 已晉級：':'確認勝者：'}${esc(m.p2.name)}</button>`:'選手 2 待定'}</div></div></div>`).join(''):'<div class="empty">這個場地／分區目前沒有比賽。</div>';saveRefFilters()}
 $('refereeVenueSelect').onchange=()=>{saveRefFilters();renderRefereeScores()};$('refereeZoneSelect').onchange=()=>{saveRefFilters();renderRefereeScores()};
-window.refereeChooseWinner=async(eid,mid,wid)=>{if(!refereeToken){alert('裁判登入已失效，請重新登入。');return}const e=findEvent(eid),m=e?.matches.find(x=>x.id===mid);if(!m||!m.p1||!m.p2)return;if(!confirm(`確認「${[m.p1,m.p2].find(p=>p.id===wid)?.name}」勝出並晉級？`))return;const snapshot=JSON.parse(JSON.stringify(e));try{judgeWinner(eid,mid,wid);const {error}=await refereeCall('ta_referee_save_event',{p_token:refereeToken,p_event:e});if(error)throw error;await refreshRefereeEvents();}catch(err){const idx=db.events.findIndex(x=>x.id===snapshot.id);if(idx>=0)db.events[idx]=snapshot;saveDb();renderRefereeScores();alert('比分／晉級同步失敗，已還原本機畫面：'+(err.message||'請重新登入後重試。'));console.error(err)}};
+window.refereeChooseWinner=async(eid,mid,wid)=>{
+ if(!refereeToken){alert('裁判登入已失效，請重新登入。');return}
+ const e=findEvent(eid);
+ if(!e){alert('找不到這場賽事，請重新整理裁判賽程。');return}
+ if(!Array.isArray(e.matches)){alert('這場賽事尚未有有效賽程，請重新整理或聯絡管理員。');return}
+ const m=e.matches.find(x=>x.id===mid);
+ if(!m){alert('找不到這場比賽，請重新整理裁判賽程。');return}
+ if(!m.p1||!m.p2){alert('兩位選手尚未就位，無法判定晉級。');return}
+ const selected=[m.p1,m.p2].find(p=>p.id===wid);
+ if(!selected){alert('所選勝者不屬於這場比賽，請重新整理後再試。');return}
+ if(!confirm(`確認「${selected.name}」勝出並晉級？`))return;
+ const snapshot=JSON.parse(JSON.stringify(e));
+ try{
+   if(m.winner?.id===wid){
+     if(!confirm('這位選手已被判定晉級。要取消判定嗎？後續受影響場次也會重設。'))return;
+     clearDownstream(e,m);m.winner=null;m.status='待比賽';
+   }else{
+     if(m.winner&&!confirm('這場已有晉級選手。確定更改判定，並重設後續受影響場次嗎？'))return;
+     clearDownstream(e,m);m.winner=[m.p1,m.p2].find(p=>p.id===wid);m.status='已完成';advanceCompletedRounds(e.matches);
+   }
+   // 只更新裁判畫面並呼叫裁判專用 RPC，避免觸發管理員/公開賽程畫面中的 null.matches。
+   const idx=db.events.findIndex(x=>x.id===e.id);
+   if(idx>=0)db.events[idx]=e;else db.events.unshift(e);
+   saveDb();renderRefereeScores();
+   const {error}=await refereeCall('ta_referee_save_event',{p_token:refereeToken,p_event:e});
+   if(error)throw error;
+   await refreshRefereeEvents();
+ }catch(err){
+   const idx=db.events.findIndex(x=>x.id===snapshot.id);
+   if(idx>=0)db.events[idx]=snapshot;else db.events.unshift(snapshot);
+   saveDb();
+   try{renderRefereeScores()}catch(renderErr){console.error('還原裁判畫面失敗',renderErr)}
+   alert('比分／晉級同步失敗，已還原本機畫面：'+(err?.message||String(err)||'請重新登入後重試。'));
+   console.error('裁判比分／晉級同步失敗',err);
+ }
+};
 $('refereeLoginForm').onsubmit=async ev=>{ev.preventDefault();const btn=$('refereeLoginBtn');btn.disabled=true;$('refereeLoginMsg').textContent='正在驗證…';try{const {data,error}=await refereeCall('ta_referee_login',{p_password:$('refereePass').value});if(error)throw error;if(!data)throw new Error('密碼錯誤或裁判登入已停用。');refereeToken=typeof data==='string'?data:(data.token||data[0]?.token||'');if(!refereeToken)throw new Error('後端未回傳裁判登入權杖。');localStorage.setItem(REF_TOKEN_KEY,refereeToken);$('refereePass').value='';$('refereeLogin').classList.add('hidden');$('refereePanel').classList.remove('hidden');await refreshRefereeEvents();$('refereeLoginMsg').textContent='';}catch(err){$('refereeLoginMsg').textContent='登入失敗：'+(err.message||'請確認裁判密碼及已執行 SQL 設定。')}finally{btn.disabled=false}};
 $('refereeEventSelect').onchange=()=>{saveRefFilters();renderRefereeScores()};$('refereeRefreshBtn').onclick=()=>refreshRefereeEvents().catch(err=>alert(err.message));$('refereeLogoutBtn').onclick=()=>{refereeToken='';localStorage.removeItem(REF_TOKEN_KEY);$('refereePanel').classList.add('hidden');$('refereeLogin').classList.remove('hidden');$('refereeLoginMsg').textContent='已登出。'};
 $('refereeSettingsForm').onsubmit=async ev=>{ev.preventDefault();const pass=$('newRefereePassword').value;if(pass.length<6){$('refereeSettingsMsg').textContent='密碼至少需要 6 個字元。';return}const btn=$('saveRefereePasswordBtn');btn.disabled=true;try{const {data,error}=await supabaseClient.rpc('ta_admin_set_referee_password',{p_password:pass,p_enabled:true});if(error)throw error;$('newRefereePassword').value='';$('refereeSettingsMsg').textContent='裁判共用密碼已更新；所有舊裁判登入已撤銷。'}catch(err){$('refereeSettingsMsg').textContent='設定失敗：'+(err.message||'請確認已執行裁判登入 SQL。')}finally{btn.disabled=false}};

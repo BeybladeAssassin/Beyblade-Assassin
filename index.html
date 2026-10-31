@@ -280,6 +280,7 @@ function makeCustomEvent(name,date,venueCount,players,published,zoneCount,rankCo
    };
    if(type==='PAIR'){for(let i=0;i<n;i+=2)add(i,i+1)}
    else if(type==='POOLED'){const groupCount=Math.ceil(n/5),baseSize=Math.floor(n/groupCount),extra=n%groupCount;let offset=0;for(let g=0;g<groupCount;g++){const size=baseSize+(g<extra?1:0),indices=Array.from({length:size},(_,i)=>offset+i);for(let i=0;i<indices.length;i++)for(let j=i+1;j<indices.length;j++)add(indices[i],indices[j]);offset+=size}}
+   else if(type==='ROUND_ROBIN'&&n===3){add(0,1);add(1,2);add(2,0)}
    else {for(let i=0;i<n;i++)for(let j=i+1;j<n;j++)add(i,j)}
    stages.push(st);
    let last=st;
@@ -386,7 +387,7 @@ function advanceStages(event){
    for(const st of event.stages){
      const ms=st.matchIds.map(id=>event.matches.find(m=>m.id===id)).filter(Boolean);
      // 淘汰賽採逐場晉級：某一場一旦判定勝者，立即填入下一階段對應位置，不必等同階段所有場次結束。
-     if(st.type==='PAIR'&&st.nextStageId){const partial=ms.map(m=>m.winner&&m.status==='已完成'?m.winner:null);if(fill(st.nextStageId,partial))changed=true;}
+     if(st.type==='PAIR'&&st.nextStageId){const nextStage=event.stages.find(x=>x.id===st.nextStageId);if(nextStage?.type==='PAIR'){const partial=ms.map(m=>m.winner&&m.status==='已完成'?m.winner:null);if(fill(st.nextStageId,partial))changed=true;}}
      if(!ms.length||!ms.every(m=>m.winner&&m.status==='已完成')||st.processed)continue;
      const standings=stageStandings(event,st),qualifiers=st.type==='PAIR'?ms.map(m=>m.winner):standings.slice(0,st.advanceCount).map(x=>x.player);
      if(st.nextStageId&&fill(st.nextStageId,qualifiers))changed=true;
@@ -503,15 +504,30 @@ function renderEvents(){let events=db.events.filter(e=>e.published&&Array.isArra
   else {const rounds=[...new Set(list.map(m=>m.round))].sort((a,b)=>a-b);columns=rounds.map(r=>({label:list.find(m=>m.round===r)?.roundName||`第 ${r} 輪`,matches:list.filter(m=>m.round===r).sort((a,b)=>a.matchNo-b.matchNo)}))}
   if(!columns.length)return '';
   const cardW=204,colGap=58,cardH=108, maxCount=Math.max(...columns.map(c=>c.matches.length),1);
-  const circularFinal=columns.length>0&&columns[columns.length-1].stage?.type==='ROUND_ROBIN'&&columns[columns.length-1].stage?.poolSize===3&&columns[columns.length-1].matches.length===3;
+  const lastStage=columns[columns.length-1]?.stage;const lastMatches=columns[columns.length-1]?.matches||[];const circularFinal=lastMatches.length===3&&(lastStage?.poolSize===3||lastStage?.type==='ROUND_ROBIN'||lastMatches.every(m=>m.scoreMode==='BO3'));
   const lastExtra=circularFinal?cardW+colGap:0;
   const height=Math.max(350,maxCount*126,circularFinal?500:0),width=columns.length*cardW+(columns.length-1)*colGap+lastExtra;
   const positions=new Map();
   columns.forEach((c,ci)=>c.matches.forEach((m,mi)=>{let x=ci*(cardW+colGap),y=(mi+.5)*height/c.matches.length;if(circularFinal&&ci===columns.length-1){const ring=[{x:0,y:58},{x:cardW+colGap,y:58},{x:(cardW+colGap)/2,y:310}][mi];x+=ring.x;y=ring.y+cardH/2;}positions.set(m.id,{x,y,match:m,ci,mi})}));
   let paths='';
   columns.forEach((c,ci)=>{if(ci===columns.length-1)return;const next=columns[ci+1];c.matches.forEach((m,mi)=>{const from=positions.get(m.id);let targets=[];if(m.nextId&&positions.has(m.nextId))targets=[positions.get(m.nextId)];else if(customStages.length){if(!(next.stage?.type==='ROUND_ROBIN'&&next.stage?.poolSize===3)){const nextIndex=Math.min(next.matches.length-1,Math.floor(mi/Math.max(1,c.matches.length/next.matches.length)));if(next.matches[nextIndex])targets=[positions.get(next.matches[nextIndex].id)].filter(Boolean)}}else if(next.matches.length){targets=[positions.get(next.matches[Math.min(next.matches.length-1,Math.floor(mi/2))].id)].filter(Boolean)}targets.forEach(to=>{const x1=from.x+cardW,y1=from.y,x2=to.x,y2=to.y,xm=(x1+x2)/2;paths+=`<path d="M ${x1} ${y1} H ${xm} V ${y2} H ${x2}" class="bracket-wire"/>`})})});
-  if(circularFinal){const last=columns[columns.length-1];const ps=last.matches.map(m=>positions.get(m.id));paths+=`<path d="M ${ps[0].x+cardW/2} ${ps[0].y} L ${ps[1].x+cardW/2} ${ps[1].y} L ${ps[2].x+cardW/2} ${ps[2].y} Z" class="bracket-wire bracket-wire-circle"/>`;}
-  const cards=columns.map((c,ci)=>{const isCircle=circularFinal&&ci===columns.length-1;return `<div class="tree-column" style="left:${ci*(cardW+colGap)}px;width:${isCircle?cardW*2+colGap:cardW}px;height:${height}px"><div class="tree-column-title">${esc(c.label)}</div>${c.matches.map((m,mi)=>{const pos=positions.get(m.id);const left=isCircle?pos.x-ci*(cardW+colGap):0;const top=isCircle?pos.y-cardH/2+48:((mi+.5)*height/c.matches.length)-cardH/2+48;return `<div class="tree-match" style="left:${left}px;top:${top}px;width:${cardW}px">${cardMatch(m)}</div>`}).join('')}</div>`}).join('');
+  
+  const cards=columns.map((c,ci)=>{
+   const isCircle=circularFinal&&ci===columns.length-1;
+   if(isCircle){
+    const order=[0,1,2].map(i=>c.matches[i]).filter(Boolean);
+    const spots=[{left:0,top:62},{left:cardW+colGap,top:62},{left:(cardW+colGap)/2,top:270}];
+    return `<div class="tree-column" style="left:${ci*(cardW+colGap)}px;width:${cardW*2+colGap}px;height:${height}px">
+      <div class="tree-column-title">三人循環賽｜同一組決賽</div>
+      <div style="position:absolute;left:0;top:42px;width:${cardW*2+colGap}px;height:410px;border:1px solid #8eb4df;border-radius:16px;background:rgba(255,255,255,.35)">
+       <div style="position:absolute;left:50%;top:8px;transform:translateX(-50%);font-size:12px;font-weight:800;color:#24517f">每人各對戰兩次｜共 3 場 BO3</div>
+       <svg width="100%" height="100%" viewBox="0 0 ${cardW*2+colGap} 410" style="position:absolute;inset:0;pointer-events:none"><path d="M ${cardW/2} 160 L ${cardW*1.5+colGap} 160 L ${(cardW*2+colGap)/2} 350 Z" fill="none" stroke="#6f98c4" stroke-width="2.5" stroke-dasharray="6 4"/></svg>
+       ${order.map((m,i)=>`<div class="tree-match" style="left:${spots[i].left}px;top:${spots[i].top}px;width:${cardW}px">${cardMatch(m)}</div>`).join('')}
+      </div>
+     </div>`;
+   }
+   return `<div class="tree-column" style="left:${ci*(cardW+colGap)}px;width:${cardW}px;height:${height}px"><div class="tree-column-title">${esc(c.label)}</div>${c.matches.map((m,mi)=>{const top=((mi+.5)*height/c.matches.length)-cardH/2+48;return `<div class="tree-match" style="left:0;top:${top}px;width:${cardW}px">${cardMatch(m)}</div>`}).join('')}</div>`;
+  }).join('');
   const complete=list.filter(m=>m.status==='已完成').length;
   return `<section class="tree-zone"><div class="tree-zone-head"><strong>${zone==='FINAL'?'總決賽':zone==='PLACEMENT'?'名次賽':esc(zone+' 區')}</strong><span>${complete}/${list.length} 場完成</span></div><div class="tree-scroll"><div class="bracket-tree" style="width:${width}px;height:${height+48}px"><svg class="tree-wires" width="${width}" height="${height+48}" viewBox="0 0 ${width} ${height+48}" aria-hidden="true"><g transform="translate(0,48)">${paths}</g></svg>${cards}</div></div></section>`;
  };

@@ -265,7 +265,7 @@ function makeCustomEvent(name,date,venueCount,players,published,zoneCount,rankCo
    const n=pool.length;
    if(n<2)throw Error(`${zone} 人數不足，至少需要 2 位選手。`);
    let type,advanceCount;
-   const finalThree=(n===3&&(zone==='FINAL'||target===1));
+   const finalThree=(n===3);
    if(finalThree){type='ROUND_ROBIN';advanceCount=3}
    else if(n===2){type='PAIR';advanceCount=Math.min(target,2)}
    else if(n>target&&n%2===0&&n/2>=target){type='PAIR';advanceCount=n/2}

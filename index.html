@@ -383,57 +383,53 @@ function syncFinalThreeEntries(event){
  if(!event?.customFormat||!Array.isArray(event.stages)||!Array.isArray(event.matches))return false;
  let changed=false;
  const finals=event.stages.filter(st=>st.type==='ROUND_ROBIN'&&st.poolSize===3);
+ const getStageMatches=st=>(st.matchIds||[]).map(id=>event.matches.find(m=>m.id===id)).filter(Boolean);
+ const completedWinner=m=>m?.winner&&m.status==='已完成'?m.winner:null;
  for(const finalStage of finals){
-  const finalIndex=event.stages.indexOf(finalStage);
-  let source=event.stages.find(st=>st.nextStageId===finalStage.id&&st.type==='PAIR');
+  // buildChain 會先建立下一階段再 push 前一階段，因此 stages 陣列順序是「決賽在前、初賽在後」。
+  // 不可用 slice(0, finalIndex) 尋找前一輪，否則舊賽事缺少 nextStageId 時永遠找不到來源。
+  const samePath=st=>st.zone===finalStage.zone&&st.phase===finalStage.phase&&st.groupIndex===finalStage.groupIndex;
+  let source=event.stages.find(st=>st.type==='PAIR'&&st.nextStageId===finalStage.id&&samePath(st));
   if(!source){
-   source=event.stages.slice(0,finalIndex).reverse().find(st=>
-    st.type==='PAIR'&&st.zone===finalStage.zone&&st.advanceCount===3&&st.matchIds?.length===3
-   );
+   source=event.stages.filter(st=>st.type==='PAIR'&&samePath(st)&&Number(st.advanceCount)===3&&getStageMatches(st).length===3)
+    .sort((a,b)=>Math.abs(Number(a.round||0)-(Number(finalStage.round||0)-1))-Math.abs(Number(b.round||0)-(Number(finalStage.round||0)-1)))[0];
   }
   if(!source)continue;
-  if(source.nextStageId!==finalStage.id){source.nextStageId=finalStage.id;changed=true}
-  if(event.finalStageId!==finalStage.id){event.finalStageId=finalStage.id;changed=true}
+  if(source.nextStageId!==finalStage.id){source.nextStageId=finalStage.id;changed=true;}
+  if(event.finalStageId!==finalStage.id&&finalStage.phase>=3){event.finalStageId=finalStage.id;changed=true;}
 
-  // Repair the preceding 12 -> 6 link for saved events created before stage links were persisted.
-  const sourceIndex=event.stages.indexOf(source);
-  const previous=event.stages.slice(0,sourceIndex).reverse().find(st=>
-   st.type==='PAIR'&&st.zone===source.zone&&st.groupIndex===source.groupIndex&&st.phase===source.phase
-  );
+  // 找到來源六人賽前一輪（例如 12 -> 6），保留每場原始索引，不能 filter 後壓縮陣列。
+  const previous=event.stages.filter(st=>st.type==='PAIR'&&samePath(st)&&Number(st.round)<Number(source.round))
+   .sort((a,b)=>Number(b.round||0)-Number(a.round||0))[0];
   if(previous){
-   if(previous.nextStageId!==source.id){previous.nextStageId=source.id;changed=true}
-   const previousWinners=previous.matchIds.map(id=>event.matches.find(m=>m.id===id))
-    .filter(m=>m&&m.winner&&m.status==='已完成').map(m=>m.winner);
+   if(previous.nextStageId!==source.id){previous.nextStageId=source.id;changed=true;}
+   const previousWinners=previous.matchIds.map(id=>completedWinner(event.matches.find(m=>m.id===id)));
    source.matchIds.forEach((id,i)=>{
     const m=event.matches.find(x=>x.id===id);if(!m)return;
     const pair=source.pairs?.[i]||[i*2,i*2+1];
     const p1=previousWinners[pair[0]]||null,p2=previousWinners[pair[1]]||null;
-    if(!m.p1&&p1){m.p1=p1;changed=true}
-    if(!m.p2&&p2){m.p2=p2;changed=true}
+    if((m.p1?.id||null)!==(p1?.id||null)){m.p1=p1;m.winner=null;m.score1='';m.score2='';m.status='待比賽';m.completedAt=null;changed=true;}
+    if((m.p2?.id||null)!==(p2?.id||null)){m.p2=p2;m.winner=null;m.score1='';m.score2='';m.status='待比賽';m.completedAt=null;changed=true;}
    });
   }
 
-  const sourceMatches=source.matchIds.map(id=>event.matches.find(m=>m.id===id)).filter(Boolean);
-  const winners=sourceMatches
-   .filter(m=>m.winner&&m.status==='已完成')
+  // 依六人淘汰賽的「實際完成時間」排列晉級順序；舊資料沒有時間時，以場次編號作穩定排序。
+  const sourceMatches=getStageMatches(source);
+  const winners=sourceMatches.filter(m=>completedWinner(m))
    .sort((a,b)=>{
     const ta=Date.parse(a.completedAt||'')||0,tb=Date.parse(b.completedAt||'')||0;
     if(ta&&tb&&ta!==tb)return ta-tb;
     if(ta&&!tb)return -1;if(tb&&!ta)return 1;
-    return (a.venueMatchNo||a.matchNo||0)-(b.venueMatchNo||b.matchNo||0);
-   })
-   .map(m=>m.winner)
-   .filter((p,i,arr)=>p&&arr.findIndex(x=>x.id===p.id)===i)
-   .slice(0,3);
+    return Number(a.matchNo||a.venueMatchNo||0)-Number(b.matchNo||b.venueMatchNo||0);
+   }).map(m=>m.winner).filter((p,i,arr)=>p&&arr.findIndex(x=>x.id===p.id)===i).slice(0,3);
   const entries=[0,1,2].map(i=>winners[i]||null);
-  event.finalThreeEntries=entries;
+  if(JSON.stringify((event.finalThreeEntries||[]).map(p=>p?.id||null))!==JSON.stringify(entries.map(p=>p?.id||null))){event.finalThreeEntries=entries;changed=true;}
   finalStage.matchIds.forEach((id,i)=>{
    const m=event.matches.find(x=>x.id===id);if(!m)return;
    const pair=finalStage.pairs?.[i]||[[0,1],[1,2],[2,0]][i]||[i,(i+1)%3];
    const p1=entries[pair[0]]||null,p2=entries[pair[1]]||null;
    if((m.p1?.id||null)!==(p1?.id||null)||(m.p2?.id||null)!==(p2?.id||null)){
-    m.p1=p1;m.p2=p2;m.winner=null;m.score1='';m.score2='';m.status='待比賽';m.completedAt=null;
-    changed=true;
+    m.p1=p1;m.p2=p2;m.winner=null;m.score1='';m.score2='';m.status='待比賽';m.completedAt=null;changed=true;
    }
    if(m.venue!=='場地 1'){m.venue='場地 1';changed=true;}
   });

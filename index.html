@@ -95,6 +95,26 @@ const SUPABASE_PUBLISHABLE_KEY='sb_publishable_iiPiRmuSiUPJawBSvMt52A_CMnZPXQ1';
 const supabaseClient=window.supabase.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY);
 const KEY='gyro_assassin_tournament_v1_numbers',DELETED_KEY='gyro_assassin_tournament_deleted_ids_v1';function loadDeletedIds(){try{return new Set(JSON.parse(localStorage.getItem(DELETED_KEY)||'[]'))}catch{return new Set()}}function saveDeletedIds(ids){localStorage.setItem(DELETED_KEY,JSON.stringify([...ids]))}let deletedEventIds=loadDeletedIds();let db=loadDb(),adminOn=false,activeEvent=null,activeZone='ALL';const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const uuid=()=>crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random().toString(16).slice(2);function loadDb(){try{return JSON.parse(localStorage.getItem(KEY))||{events:[]}}catch{return{events:[]}}}function saveDb(){localStorage.setItem(KEY,JSON.stringify(db))}let cloudReady=false,cloudSyncMessage='';async function syncEventToCloud(e){try{const {data:{session}}=await supabaseClient.auth.getSession();if(!session)return;const row={event_id:e.id,state:e,created_by:session.user.id,updated_at:new Date().toISOString()};const {error}=await supabaseClient.from('ta_event_state').upsert(row,{onConflict:'event_id'});if(error)throw error;cloudSyncMessage='雲端已同步';}catch(err){cloudSyncMessage='雲端同步失敗：'+(err.message||'未知錯誤');console.error(cloudSyncMessage,err)}}async function loadCloudEvents(){try{const {data,error}=await supabaseClient.from('ta_event_state').select('event_id,state,updated_at');if(error)throw error;const rows=data||[];const remote=rows.map(r=>r.state).filter(e=>e&&e.id&&!deletedEventIds.has(e.id));const remoteIds=new Set(remote.map(e=>e.id));/* Cloud is authoritative after a successful read: do not merge local-only events, which can resurrect deleted events on this browser. */db.events=remote;saveDb();cloudReady=true;renderEvents();if(adminOn)renderAdmin();const id=new URLSearchParams(location.search).get('event');const e=id&&findEvent(id);if(e&&e.published)openEvent(id);else if(id&&!e){activeEvent=null;$('eventDetail').classList.add('hidden')}return remoteIds}catch(err){console.error('讀取雲端賽事失敗',err);cloudSyncMessage='雲端讀取失敗：'+(err.message||'請確認已執行雲端資料表 SQL');return new Set()}}async function uploadLocalEventsToCloud(remoteIds){/* Never auto-upload local-only events on login: they may have been deleted from cloud and would be resurrected. New/edited events sync through saveEvent(). */return remoteIds}
 let cloudRealtimeChannel=null,cloudPollTimer=null,lastCloudRefresh=0;
+let refereeLiveRefreshTimer=null,refereePollTimer=null,refereeRefreshPromise=null,refereeSaving=false,lastRefereeRefresh=0;
+function scheduleRefereeLiveRefresh(delay=250){
+ if(!refereeToken||$('refereePanel')?.classList.contains('hidden'))return;
+ clearTimeout(refereeLiveRefreshTimer);
+ refereeLiveRefreshTimer=setTimeout(()=>{
+  if(!refereeToken||refereeSaving||document.visibilityState!=='visible')return;
+  void refreshRefereeEvents().catch(err=>console.warn('裁判即時同步失敗：',err));
+ },delay);
+}
+function startRefereeLiveSync(){
+ if(refereePollTimer)return;
+ refereePollTimer=setInterval(()=>{
+  if(refereeToken&&document.visibilityState==='visible'&&!refereeSaving&&Date.now()-lastRefereeRefresh>=2800){
+   void refreshRefereeEvents().catch(err=>console.warn('裁判定時同步失敗：',err));
+  }
+ },3000);
+ document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible'&&refereeToken)scheduleRefereeLiveRefresh(100);
+ });
+}
 function applyRemoteEvent(row,eventType='UPDATE'){
  if(!row)return;
  const id=row.event_id;
@@ -113,6 +133,7 @@ function startCloudRealtime(){
    lastCloudRefresh=Date.now();
    if(payload.eventType==='DELETE')applyRemoteEvent(payload.old,'DELETE');
    else applyRemoteEvent(payload.new,payload.eventType);
+   scheduleRefereeLiveRefresh(180);
   })
   .subscribe(status=>{console.log('賽事即時同步狀態：',status);if(status==='SUBSCRIBED')void loadCloudEvents();});
  // 即時推播若因網路或 Realtime 設定未啟用而不可用，仍每 15 秒補查一次。
@@ -945,7 +966,26 @@ function judgeWinner(eid,mid,wid){let e=findEvent(eid);if(!e)return;if(!Array.is
 // 裁判共用密碼：驗證與權限由 Supabase RPC 執行，前端不保存密碼，只保存短期裁判 token。
 const REF_TOKEN_KEY='gyro_assassin_referee_token_v1';let refereeToken=localStorage.getItem(REF_TOKEN_KEY)||'';const REF_FILTER_KEY='gyro_assassin_referee_filters_v1';function loadRefFilters(){try{return JSON.parse(localStorage.getItem(REF_FILTER_KEY)||'{}')}catch{return {}}}function saveRefFilters(){localStorage.setItem(REF_FILTER_KEY,JSON.stringify({event:$('refereeEventSelect')?.value||'',venue:$('refereeVenueSelect')?.value||'ALL',zone:$('refereeZoneSelect')?.value||'ALL'}))}
 function refereeCall(name,args){return supabaseClient.rpc(name,args)}
-async function refreshRefereeEvents(){if(!refereeToken)throw new Error('裁判登入已失效，請重新登入。');const {data,error}=await refereeCall('ta_referee_list_events',{p_token:refereeToken});if(error)throw error;const events=(data||[]).map(r=>r.state).filter(Boolean);db.events=events;saveDb();renderEvents();const sel=$('refereeEventSelect'),saved=loadRefFilters(),old=sel.value||saved.event;sel.innerHTML=events.map(e=>`<option value="${esc(e.id)}">${esc(e.name)}</option>`).join('');if(events.some(e=>e.id===old))sel.value=old;else if(saved.event&&events.some(e=>e.id===saved.event))sel.value=saved.event;renderRefereeScores();return events}
+async function refreshRefereeEvents(){
+ if(!refereeToken)throw new Error('裁判登入已失效，請重新登入。');
+ if(refereeRefreshPromise)return refereeRefreshPromise;
+ refereeRefreshPromise=(async()=>{
+  const {data,error}=await refereeCall('ta_referee_list_events',{p_token:refereeToken});
+  if(error)throw error;
+  const events=(data||[]).map(r=>r.state).filter(Boolean);
+  const previousEvent=$('refereeEventSelect')?.value||loadRefFilters().event||'';
+  db.events=events;saveDb();renderEvents();
+  const sel=$('refereeEventSelect'),saved=loadRefFilters();
+  sel.innerHTML=events.map(e=>`<option value="${esc(e.id)}">${esc(e.name)}</option>`).join('');
+  if(events.some(e=>e.id===previousEvent))sel.value=previousEvent;
+  else if(saved.event&&events.some(e=>e.id===saved.event))sel.value=saved.event;
+  renderRefereeScores();
+  lastRefereeRefresh=Date.now();
+  return events;
+ })();
+ try{return await refereeRefreshPromise}
+ finally{refereeRefreshPromise=null}
+}
 function renderRefereeScores(){const eid=$('refereeEventSelect')?.value;const e=findEvent(eid);if(!e){$('refereeScoreList').innerHTML='<div class="empty">目前沒有可操作的公開賽事。</div>';return}if(syncFinalThreeEntries(e))saveEvent(e);const matches=e.matches||[],saved=loadRefFilters(),finalStage=getFinalThreeStage(e);if(finalStage)finalStage.matchIds.forEach(id=>{const m=matches.find(x=>x.id===id);if(m)m.venue='場地 1'});const oldVenue=$('refereeVenueSelect').value||saved.venue||'ALL',oldZone=$('refereeZoneSelect').value||saved.zone||'ALL';const venues=[...new Set(matches.map(m=>m.venue||'場地 1'))].sort((a,b)=>Number(a.replace(/\D/g,''))-Number(b.replace(/\D/g,'')));const zones=[...new Set(matches.map(m=>m.zone||'A'))];$('refereeVenueSelect').innerHTML='<option value="ALL">全部場地</option>'+venues.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('');$('refereeZoneSelect').innerHTML='<option value="ALL">全部分區</option>'+zones.map(z=>`<option value="${esc(z)}">${z==='FINAL'?'決賽區':z==='PLACEMENT'?'名次賽':esc(z+' 區')}</option>`).join('');if([...$('refereeVenueSelect').options].some(o=>o.value===oldVenue))$('refereeVenueSelect').value=oldVenue;if([...$('refereeZoneSelect').options].some(o=>o.value===oldZone))$('refereeZoneSelect').value=oldZone;const finalIds=new Set(finalStage?.matchIds||[]);
 const matchesPass=m=>($('refereeVenueSelect').value==='ALL'||(m.venue||'場地 1')===$('refereeVenueSelect').value)&&($('refereeZoneSelect').value==='ALL'||(m.zone||'A')===$('refereeZoneSelect').value);
 const filtered=matches.filter(m=>!finalIds.has(m.id)&&matchesPass(m)).sort((a,b)=>String(a.venue||'').localeCompare(String(b.venue||''),'zh-Hant',{numeric:true})||(a.venueMatchNo||a.matchNo)-(b.venueMatchNo||b.matchNo));
@@ -967,6 +1007,7 @@ window.refereeChooseWinner=async(eid,mid,wid)=>{
  if(!selected){alert('所選勝者不屬於這場比賽，請重新整理後再試。');return}
  if(!confirm(`確認「${selected.name}」勝出並晉級？`))return;
  const snapshot=JSON.parse(JSON.stringify(e));
+ refereeSaving=true;
  try{
    if(m.winner?.id===wid){
      if(!confirm('這位選手已被判定晉級。要取消判定嗎？後續受影響場次也會重設。'))return;
@@ -990,14 +1031,18 @@ window.refereeChooseWinner=async(eid,mid,wid)=>{
    try{renderRefereeScores()}catch(renderErr){console.error('還原裁判畫面失敗',renderErr)}
    alert('比分／晉級同步失敗，已還原本機畫面：'+(err?.message||String(err)||'請重新登入後重試。'));
    console.error('裁判比分／晉級同步失敗',err);
+ }finally{
+  refereeSaving=false;
+  lastRefereeRefresh=Date.now();
+  scheduleRefereeLiveRefresh(350);
  }
 };
-$('refereeLoginForm').onsubmit=async ev=>{ev.preventDefault();const btn=$('refereeLoginBtn');btn.disabled=true;$('refereeLoginMsg').textContent='正在驗證…';try{const {data,error}=await refereeCall('ta_referee_login',{p_password:$('refereePass').value});if(error)throw error;if(!data)throw new Error('密碼錯誤或裁判登入已停用。');refereeToken=typeof data==='string'?data:(data.token||data[0]?.token||'');if(!refereeToken)throw new Error('後端未回傳裁判登入權杖。');localStorage.setItem(REF_TOKEN_KEY,refereeToken);$('refereePass').value='';$('refereeLogin').classList.add('hidden');$('refereePanel').classList.remove('hidden');await refreshRefereeEvents();$('refereeLoginMsg').textContent='';}catch(err){$('refereeLoginMsg').textContent='登入失敗：'+(err.message||'請確認裁判密碼及已執行 SQL 設定。')}finally{btn.disabled=false}};
-$('refereeEventSelect').onchange=()=>{saveRefFilters();renderRefereeScores()};$('refereeRefreshBtn').onclick=()=>refreshRefereeEvents().catch(err=>alert(err.message));$('refereeLogoutBtn').onclick=()=>{refereeToken='';localStorage.removeItem(REF_TOKEN_KEY);$('refereePanel').classList.add('hidden');$('refereeLogin').classList.remove('hidden');$('refereeLoginMsg').textContent='已登出。'};
+$('refereeLoginForm').onsubmit=async ev=>{ev.preventDefault();const btn=$('refereeLoginBtn');btn.disabled=true;$('refereeLoginMsg').textContent='正在驗證…';try{const {data,error}=await refereeCall('ta_referee_login',{p_password:$('refereePass').value});if(error)throw error;if(!data)throw new Error('密碼錯誤或裁判登入已停用。');refereeToken=typeof data==='string'?data:(data.token||data[0]?.token||'');if(!refereeToken)throw new Error('後端未回傳裁判登入權杖。');localStorage.setItem(REF_TOKEN_KEY,refereeToken);$('refereePass').value='';$('refereeLogin').classList.add('hidden');$('refereePanel').classList.remove('hidden');startRefereeLiveSync();await refreshRefereeEvents();$('refereeLoginMsg').textContent='';}catch(err){$('refereeLoginMsg').textContent='登入失敗：'+(err.message||'請確認裁判密碼及已執行 SQL 設定。')}finally{btn.disabled=false}};
+$('refereeEventSelect').onchange=()=>{saveRefFilters();renderRefereeScores()};$('refereeRefreshBtn').onclick=()=>refreshRefereeEvents().catch(err=>alert(err.message));$('refereeLogoutBtn').onclick=()=>{refereeToken='';clearTimeout(refereeLiveRefreshTimer);localStorage.removeItem(REF_TOKEN_KEY);$('refereePanel').classList.add('hidden');$('refereeLogin').classList.remove('hidden');$('refereeLoginMsg').textContent='已登出。'};
 $('refereeSettingsForm').onsubmit=async ev=>{ev.preventDefault();const pass=$('newRefereePassword').value;if(pass.length<6){$('refereeSettingsMsg').textContent='密碼至少需要 6 個字元。';return}const btn=$('saveRefereePasswordBtn');btn.disabled=true;try{const {data,error}=await supabaseClient.rpc('ta_admin_set_referee_password',{p_password:pass,p_enabled:true});if(error)throw error;$('newRefereePassword').value='';$('refereeSettingsMsg').textContent='裁判共用密碼已更新；所有舊裁判登入已撤銷。'}catch(err){$('refereeSettingsMsg').textContent='設定失敗：'+(err.message||'請確認已執行裁判登入 SQL。')}finally{btn.disabled=false}};
 $('disableRefereeBtn').onclick=async()=>{if(!confirm('確定立即停用所有裁判登入？'))return;try{const {error}=await supabaseClient.rpc('ta_admin_set_referee_password',{p_password:null,p_enabled:false});if(error)throw error;$('refereeSettingsMsg').textContent='裁判登入已停用，所有舊裁判登入已撤銷。'}catch(err){$('refereeSettingsMsg').textContent='停用失敗：'+(err.message||'請確認已執行裁判登入 SQL。')}};
 // 頁面重新整理後沿用本機保存的裁判 token；後端仍會檢查 token 是否有效／撤銷。
-if(refereeToken){showPage('referee');$('refereeLogin').classList.add('hidden');$('refereePanel').classList.remove('hidden');refreshRefereeEvents().catch(err=>{refereeToken='';localStorage.removeItem(REF_TOKEN_KEY);$('refereePanel').classList.add('hidden');$('refereeLogin').classList.remove('hidden');$('refereeLoginMsg').textContent='登入已失效，請重新登入。';console.warn(err)})}
+if(refereeToken){showPage('referee');$('refereeLogin').classList.add('hidden');$('refereePanel').classList.remove('hidden');startRefereeLiveSync();refreshRefereeEvents().catch(err=>{refereeToken='';localStorage.removeItem(REF_TOKEN_KEY);$('refereePanel').classList.add('hidden');$('refereeLogin').classList.remove('hidden');$('refereeLoginMsg').textContent='登入已失效，請重新登入。';console.warn(err)})}
 
 
 window.openEvent=openEvent;window.setZone=setZone;window.judgeWinner=judgeWinner;function initial(){renderEvents();let id=new URLSearchParams(location.search).get('event');let e=id&&findEvent(id);if(e&&e.published)openEvent(id);startCloudRealtime();void loadCloudEvents()}initial();

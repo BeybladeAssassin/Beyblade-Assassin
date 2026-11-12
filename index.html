@@ -523,9 +523,17 @@ function makeEvent(name,date,venueCount,names,published,zoneCount=0,rankCount=1,
  }
  if(rankCount>=3){const semis=matches.filter(m=>m.nextId===finalMatch.id);if(semis.length===2){const bronze=newMatch('PLACEMENT',1,'季軍賽');bronze.progressGroup='BRONZE';semis.forEach((m,i)=>{m.loserNextId=bronze.id;m.loserNextSlot=i+1});matches.push(bronze);}}
  advanceCompletedRounds(matches);
- const courtCount=Math.max(1,Number(venueCount)||1),byRound=new Map();matches.forEach(m=>{const key=m.zone+'|'+m.round;if(!byRound.has(key))byRound.set(key,[]);byRound.get(key).push(m)});
- for(const group of byRound.values())group.forEach((m,i)=>{m.venue='場地 '+(i%courtCount+1)});
- const venueCounters={};matches.forEach(m=>{m.venueMatchNo=(venueCounters[m.venue]=(venueCounters[m.venue]||0)+1)});
+ const courtCount=Math.max(1,Number(venueCount)||1),byRound=new Map();
+ // 場地以「整個賽事的輪次」統一分配，不再按分區各自從場地 1 開始。
+ // 首輪輪空只是一個晉級節點，不是實際比賽，不得占用場地或造成場地閒置。
+ matches.forEach(m=>{const key=Number(m.round)||1;if(!byRound.has(key))byRound.set(key,[]);byRound.get(key).push(m)});
+ for(const [round,group] of [...byRound.entries()].sort((a,b)=>a[0]-b[0])){
+  const playable=group.filter(m=>!(m.status==='輪空晉級'||(m.p1&&!m.p2)||(m.p2&&!m.p1)));
+  const byes=group.filter(m=>m.status==='輪空晉級'||(!!m.p1!==!!m.p2));
+  playable.sort((a,b)=>a.matchNo-b.matchNo).forEach((m,i)=>{m.venue='場地 '+(i%courtCount+1)});
+  byes.forEach(m=>{m.venue='輪空（不占用場地）';m.venueMatchNo=0});
+ }
+ const venueCounters={};matches.forEach(m=>{if(m.venue==='輪空（不占用場地）'){m.venueMatchNo=0;return}m.venueMatchNo=(venueCounters[m.venue]=(venueCounters[m.venue]||0)+1)});
  return{id:uuid(),name,date,venueCount:Number(venueCount),zoneCount:zones.length,rankCount,players,matches,zones,published,createdAt:new Date().toISOString(),scheduleGenerated:true,rosterConfirmed:true,stages:[],customFormat:false,finalStageId:null,mergeConfig:null,placementConfig:null,rankGroupStageIds:null,zoneFinalStageIds:{},finalThreeEntries:[],finalRanking:null,seedDraw:{ids:finalSeedIds,zones,createdAt:new Date().toISOString()}};
 }
 function stageStandings(event,stage){

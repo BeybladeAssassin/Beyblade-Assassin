@@ -456,10 +456,8 @@ function makeEvent(name,date,venueCount,names,published,zoneCount=0,rankCount=1)
  rankCount=Math.max(1,Math.min(8,Number(rankCount)||1));
  const zones=validateNoByes(players.length,zoneCount,venueCount),counts=Object.fromEntries(zones.map(z=>[z,0]));
  players.forEach((p,i)=>counts[zones[i%zones.length]]++);
- // 每區人數都是 2 的次方時才使用標準淘汰樹；多區也必須尊重使用者選擇。
- const legacyCompatible=zones.every(z=>isPowerOfTwo(counts[z]));
- if(legacyCompatible)return makeEventLegacy(name,date,venueCount,players,published,zones.length,rankCount);
- return makeCustomEvent(name,date,venueCount,players,published,zones.length,rankCount);
+   // 2026-11 賽制：全面使用單淘汰樹。只有第一輪可輪空，第二輪起必須雙方到齊實際比賽。
+  return makeEventLegacy(name,date,venueCount,players,published,zones.length,rankCount);
 }
 function stageStandings(event,stage){
  const ms=stage.matchIds.map(id=>event.matches.find(m=>m.id===id)).filter(Boolean),stats=new Map();
@@ -639,7 +637,7 @@ function makeRosterEvent(name,date,venueCount,names,published,zoneCount=0,rankCo
 function generateScheduleForEvent(e){if(e.scheduleGenerated||(e.matches&&e.matches.length)){throw Error('這場賽事已產生賽程。')}const eligible=e.players.filter(p=>p.checkedIn&&!p.withdrawn);if(eligible.length<2)throw Error('至少需要 2 位已報到的選手才能產生賽程。');if((Number(e.rankCount)||1)>eligible.length)throw Error(`目前只有 ${eligible.length} 位已報到選手，無法取前 ${e.rankCount} 名。請調整獲獎名額。`);const unreportedMains=e.players.filter(p=>p.role!=='reserve'&&!p.withdrawn&&!p.checkedIn);const missingMainNumbers=unreportedMains.map(p=>p.number);const checkedReserves=eligible.filter(p=>p.role==='reserve');checkedReserves.forEach((p,i)=>{p.role='main';p.number=missingMainNumbers[i]||p.number;p.promotedFromReserve=true;p.zone='待分區';p.seed=null});unreportedMains.forEach(p=>{p.role='reserve';p.number='';p.zone='候補';p.seed=null;p.inBracket=false;p.withdrawn=false;p.movedToReserveAfterCheckin=true});const waitingReserves=e.players.filter(p=>p.role==='reserve'&&!p.withdrawn);waitingReserves.forEach((p,i)=>{p.number='候補'+(i+1);p.zone='候補';p.seed=null;p.inBracket=false});const built=makeEvent(e.name,e.date,e.venueCount,eligible.map(p=>({...p})),e.published,e.zoneCount||e.zones?.length||0,e.rankCount||1);const eligibleIds=new Set(built.players.map(p=>p.id));e.players.forEach(p=>{p.inBracket=eligibleIds.has(p.id);const assigned=built.players.find(x=>x.id===p.id);if(assigned){p.zone=assigned.zone;p.seed=assigned.seed}});e.matches=built.matches;e.zones=built.zones;e.stages=built.stages||[];e.customFormat=!!built.customFormat;e.finalStageId=built.finalStageId||null;e.mergeConfig=built.mergeConfig||null;e.placementConfig=built.placementConfig||null;e.rankGroupStageIds=built.rankGroupStageIds||null;e.zoneFinalStageIds=built.zoneFinalStageIds||{};e.finalThreeEntries=[];e.finalRanking=null;e.tieBreakRequired=false;e.tieBreakStageId=null;e.scheduleGenerated=true;e.rosterConfirmed=true;e.generatedAt=new Date().toISOString();if(e.customFormat)advanceStages(e);return e}
 function addReservePlayer(e,name){name=String(name||'').trim();if(!name)throw Error('請輸入候補選手姓名。');if(e.players.some(p=>p.name.toLowerCase()===name.toLowerCase()))throw Error('已有同名選手，請確認名單。');const reserveNo=e.players.filter(p=>p.role==='reserve').length+1;e.players.push({id:uuid(),name,number:'候補'+reserveNo,zone:'候補',seed:null,checkedIn:false,role:'reserve',inBracket:false});}
 function replaceWithReserve(e,mainId,reserveId){const main=e.players.find(p=>p.id===mainId),reserve=e.players.find(p=>p.id===reserveId);if(!main||!reserve||reserve.role!=='reserve')throw Error('找不到正選或候補選手。');if(!reserve.checkedIn)throw Error('候補選手必須先完成報到才能遞補。');if(main.role==='reserve')throw Error('請選擇正選選手進行遞補。');if(!e.scheduleGenerated)throw Error('請先確認報到名單並產生賽程。');if(e.matches.some(m=>m.winner&&(m.p1?.id===main.id||m.p2?.id===main.id)))throw Error('這位正選已經有完成的比賽紀錄，為保護晉級結果，不能直接替換。請先處理受影響的比賽。');let found=false;for(const m of e.matches){for(const slot of ['p1','p2'])if(m[slot]?.id===main.id){m[slot]={...reserve,zone:main.zone,seed:main.seed,inBracket:true};found=true}}if(!found)throw Error('找不到這位正選在賽程中的位置。');main.inBracket=false;main.withdrawn=true;reserve.role='main';reserve.number=main.number;reserve.zone=main.zone;reserve.seed=main.seed;reserve.inBracket=true;reserve.replacedPlayerId=main.id;return true}
-// 僅在同一分區、同一輪所有實際有選手的場次都完成後，才把勝者送入下一輪。空場次不阻擋賽程；真正的輪空會等待該輪整體解鎖後再往下推進。
+// 同輪完成後同步晉級；輪空只允許在第一輪建立賽程時產生，第二輪起禁止自動輪空。
 function advanceCompletedRounds(matches){
  let changed=true,guard=0;
  while(changed&&guard++<matches.length+2){
@@ -657,16 +655,10 @@ function advanceCompletedRounds(matches){
      if(n){
       const slot=m.nextSlot===1?'p1':'p2';
       if(n[slot]?.id!==m.winner.id){n[slot]=m.winner;changed=true}
-      if(n.zone===m.zone&&n.zone!=='FINAL'&&n.zone!=='PLACEMENT'){
-       if(n.p1&&n.p2){
-        if(n.status==='輪空晉級'){n.winner=null;n.status='待比賽';changed=true}
-       }else if(n.p1||n.p2){
-        const solo=n.p1||n.p2;
-        if(n.winner?.id!==solo.id||n.status!=='輪空晉級'){n.winner=solo;n.status='輪空晉級';changed=true}
-       }
+             // 第二輪起不自動判定輪空；僅第一輪建表時可產生輪空晉級。
+       if(n.status==='輪空晉級'&&Number(n.round)>1){n.winner=null;n.status='待比賽';changed=true}
       }
      }
-    }
     if(m.loserNextId&&loser){
      const n=matches.find(x=>x.id===m.loserNextId);
      if(n){

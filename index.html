@@ -451,11 +451,14 @@ function makeCustomEvent(name,date,venueCount,players,published,zoneCount,rankCo
  return event;
 }
 function makeEvent(name,date,venueCount,names,published,zoneCount=0,rankCount=1){
- // 全人數統一單淘汰：只在各分區第一輪依 2 的次方補位，產生必要輪空；後續每輪均由前輪勝者兩兩配對。
+ // 單淘汰：輪空僅能發生在整場賽事的第一輪，後續一律完整雙人對戰。
  const players=names.map((item,i)=>typeof item==='string'?({id:uuid(),name:item.trim(),number:String(i+1).padStart(3,'0'),zone:'',seed:i+1,checkedIn:true,role:'main',inBracket:true}):({...item,name:String(item.name||'').trim(),number:item.number||String(i+1).padStart(3,'0'),zone:'',seed:i+1,checkedIn:item.checkedIn!==false,role:item.role||'main',inBracket:true})).filter(p=>p.name);
  if(players.length<2)throw Error('至少需要 2 位參賽者。');
  rankCount=Math.max(1,Math.min(8,Number(rankCount)||1));
- const zones=validateNoByes(players.length,zoneCount,venueCount),groups=Object.fromEntries(zones.map(z=>[z,[]]));
+ const zones=validateNoByes(players.length,zoneCount,venueCount);
+ // 三區區冠軍無法在不額外輪空的情況下產生總冠軍；禁止生成會中途斷掉的賽程。
+ if(zones.length===3)throw Error('三區冠軍無法在第二輪以後完全不輪空。請改用 1、2 或 4 區。');
+ const groups=Object.fromEntries(zones.map(z=>[z,[]]));
  players.forEach((p,i)=>{p.zone=zones[i%zones.length];groups[p.zone].push(p)});
  const matches=[];let matchNo=1;
  const newMatch=(zone,round,roundName,p1=null,p2=null)=>({id:uuid(),zone,round,roundName,matchNo:matchNo++,venue:'場地 1',venueMatchNo:0,p1,p2,winner:null,score1:'',score2:'',status:'待比賽',nextId:null,nextSlot:null,loserNextId:null,loserNextSlot:null});
@@ -463,13 +466,14 @@ function makeEvent(name,date,venueCount,names,published,zoneCount=0,rankCount=1)
  for(const zone of zones){
   const ps=shuffle([...groups[zone]]),size=2**Math.ceil(Math.log2(ps.length)),byeCount=size-ps.length;
   const slots=[...ps.slice(0,byeCount).map(p=>[p,null])];
-  const rest=ps.slice(byeCount);for(let i=0;i<rest.length;i+=2)slots.push([rest[i]||null,rest[i+1]||null]);
+  const rest=ps.slice(byeCount);for(let i=0;i<rest.length;i+=2)slots.push([rest[i],rest[i+1]]);
   let previous=[];const rounds=Math.log2(size);
   for(let r=1;r<=rounds;r++){
    const count=size/2**r,current=[];
    for(let i=0;i<count;i++){
-    const m=newMatch(zone,r,r===rounds?(zones.length===1?'總冠軍戰':'區冠軍戰'):`${size/2**(r-1)} 強`);
-    if(r===1){m.p1=slots[i]?.[0]||null;m.p2=slots[i]?.[1]||null;if(!!m.p1!==!!m.p2){m.winner=m.p1||m.p2;m.status='輪空晉級'}}
+    const roundName=r===rounds?(zones.length===1?'冠亞軍賽':'區冠亞軍賽'):(r===rounds-1?'4 強賽':`${size/2**(r-1)} 強賽`);
+    const m=newMatch(zone,r,roundName);
+    if(r===1){m.p1=slots[i][0];m.p2=slots[i][1];if(m.p1&&!m.p2){m.winner=m.p1;m.status='輪空晉級'}}
     else{previous[i*2].nextId=m.id;previous[i*2].nextSlot=1;previous[i*2+1].nextId=m.id;previous[i*2+1].nextSlot=2}
     current.push(m);matches.push(m);
    }
@@ -477,25 +481,27 @@ function makeEvent(name,date,venueCount,names,published,zoneCount=0,rankCount=1)
   }
   zoneChampions.push(previous[0]);
  }
- let finalMatch=null,bronzeMatch=null;
- if(zoneChampions.length===1){finalMatch=zoneChampions[0]}
- else{
-  let current=zoneChampions;
-  let round=1;
-  while(current.length>1){
-   const next=[];
-   for(let i=0;i<current.length;i+=2){
-    const m=newMatch('FINAL',round,current.length===2?'總冠軍戰':`${current.length} 強`);
-    current[i].nextId=m.id;current[i].nextSlot=1;
-    if(current[i+1]){current[i+1].nextId=m.id;current[i+1].nextSlot=2}
-    next.push(m);matches.push(m);
+ let finalMatch=zoneChampions[0];
+ if(zoneChampions.length>1){
+  let previous=zoneChampions,round=1;
+  while(previous.length>1){
+   const current=[];
+   for(let i=0;i<previous.length;i+=2){
+    const m=newMatch('FINAL',round,previous.length===2?'總冠亞軍賽':'總決賽 4 強');
+    previous[i].nextId=m.id;previous[i].nextSlot=1;
+    previous[i+1].nextId=m.id;previous[i+1].nextSlot=2;
+    current.push(m);matches.push(m);
    }
-   current=next;round++;
+   previous=current;round++;
   }
-  finalMatch=current[0];
-  if(rankCount>=3&&zoneChampions.length>=4){
-   const semis=matches.filter(m=>m.zone==='FINAL'&&m.round===round-1).sort((a,b)=>a.matchNo-b.matchNo);
-   if(semis.length===2){bronzeMatch=newMatch('PLACEMENT',1,'季軍賽');bronzeMatch.progressGroup='BRONZE';semis.forEach((m,i)=>{m.loserNextId=bronzeMatch.id;m.loserNextSlot=i+1});matches.push(bronzeMatch)}
+  finalMatch=previous[0];
+ }
+ // 三、四名賽：取實際總冠亞軍賽前一輪的兩位敗者。
+ if(rankCount>=3){
+  const semis=matches.filter(m=>m.nextId===finalMatch.id);
+  if(semis.length===2){
+   const bronze=newMatch('PLACEMENT',1,'季軍賽');bronze.progressGroup='BRONZE';
+   semis.forEach((m,i)=>{m.loserNextId=bronze.id;m.loserNextSlot=i+1});matches.push(bronze);
   }
  }
  advanceCompletedRounds(matches);
@@ -701,13 +707,9 @@ function advanceCompletedRounds(matches){
      if(n){
       const slot=m.nextSlot===1?'p1':'p2';
       if(n[slot]?.id!==m.winner.id){n[slot]=m.winner;changed=true}
-      if(n.zone===m.zone&&n.zone!=='FINAL'&&n.zone!=='PLACEMENT'){
-       if(n.p1&&n.p2){
-        if(n.status==='輪空晉級'){n.winner=null;n.status='待比賽';changed=true}
-       }else if(n.p1||n.p2){
-        const solo=n.p1||n.p2;
-        if(n.winner?.id!==solo.id||n.status!=='輪空晉級'){n.winner=solo;n.status='輪空晉級';changed=true}
-       }
+      // 第二輪起不得因暫時只有一位勝者到位就判定輪空。
+      if(n.p1&&n.p2&&n.status==='輪空晉級'){
+       n.winner=null;n.status='待比賽';changed=true;
       }
      }
     }
